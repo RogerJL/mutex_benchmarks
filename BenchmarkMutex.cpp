@@ -28,9 +28,40 @@
 #include <pthread.h>
 #endif
 
+/*
+ * This benchmark is disturbed by realtime trottling (see https://lwn.net/Articles/296419/) I have found these values to work quite well
+ * 
+ * # echo  5000000 > /proc/sys/kernel/sched_rt_period_us
+ * # echo  4990000 > /proc/sys/kernel/sched_rt_runtime_us
+ */
+int set_realtime_priority(pid_t pid, int policy, int priority)
+{
+        struct sched_param schp;
+        memset(&schp, 0, sizeof(schp));
+        schp.sched_priority = priority;
+
+        /*
+        * set the process to realtime privs
+        */
+
+        printf("Attempt to set realtime for pid %d ", pid);
+
+        // do not set SCHED_RESET_ON_FORK bit as we have no control over what threads are used in benchmark
+        if (sched_setscheduler(pid, policy, &schp) == 0) {
+            printf("- done!\n");
+            return 0;
+        }
+        printf("- failed!\n");
+        perror("sched_setscheduler");
+
+
+        return -1;
+}
+
 // todo: try WTF lock (aka parking lot)
 
-inline void futex_wait(std::atomic<uint32_t>& to_wait_on, uint32_t expected)
+template<typename T>
+inline void futex_wait(std::atomic<T>& to_wait_on, T expected)
 {
 #ifdef _WIN32
 	WaitOnAddress(&to_wait_on, &expected, sizeof(expected), INFINITE);
@@ -56,6 +87,91 @@ inline void futex_wake_all(std::atomic<T>& to_wake)
 	syscall(SYS_futex, &to_wake, FUTEX_WAKE_PRIVATE, std::numeric_limits<int>::max(), nullptr, nullptr, 0);
 #endif
 }
+
+template<typename T>
+struct circular_work_queue
+{
+    static constexpr int32_t unlocked = 1;
+    static constexpr int32_t locked = 0;
+    static constexpr int32_t sleeper = -1;
+
+    circular_work_queue(unsigned _slots) :
+        slots{_slots},
+        write_index{0},
+        read_index{0},
+        futexes{new std::atomic<int32_t>[_slots]},
+        work_packages{new T[_slots]}
+        {
+        // all threads might sleep
+        for (unsigned ix = 0; ix < _slots; ix++) {
+            futexes[ix] = locked;
+        }
+    }
+
+    ~circular_work_queue() {
+        delete [] futexes;
+        delete [] work_packages;
+    }
+
+    /* Idea: if there are work waiting on the queue, there should be no wait */
+    T pop() {
+        const uint32_t index = read_index.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t slot = index % slots;
+        std::atomic<int32_t> &state = futexes[slot];
+
+        if (state.exchange(locked, std::memory_order_acquire) == unlocked)
+            return work_packages[slot];
+        while (state.exchange(sleeper, std::memory_order_acquire) != unlocked)
+        {
+            futex_wait(state, sleeper);
+        }
+        return work_packages[slot];
+    }
+
+    void push(T work_to_do) {
+        const uint32_t w_index = write_index.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t slot = w_index % slots;
+        std::atomic<int32_t> &state = futexes[slot];
+
+        work_packages[slot] = work_to_do;
+
+        if (state.exchange(unlocked, std::memory_order_release) == sleeper)
+            futex_wake_single(state);
+    }
+
+private:
+    unsigned slots;
+    std::atomic<uint32_t> write_index;
+    std::atomic<uint32_t> read_index;
+    std::atomic<int32_t> *futexes;
+    T *work_packages;
+};
+
+#define MAX_CONCURRENT_QUEUED_ITEMS (1U)
+#define MAX_QUEUING_THREADS (2*std::thread::hardware_concurrency())
+struct circular_futex
+{
+    circular_futex() :
+        queue{std::max(MAX_CONCURRENT_QUEUED_ITEMS, MAX_QUEUING_THREADS)}
+    {
+        unlock();
+    }
+
+    void lock() {
+        int work_to_do = queue.pop();
+        // process work
+        //printf("work %d\n", work_to_do);
+    }
+
+    void unlock() {
+        // store new work
+        static int counter;
+        queue.push(counter++);
+    }
+private:
+    circular_work_queue<int> queue;
+};
+
 
 struct ticket_mutex
 {
@@ -684,6 +800,7 @@ void benchmark_mutex_lock_unlock(benchmark::State& state)
 #endif
 
 #define RegisterBenchmarkWithAllMutexes(benchmark, ...)\
+    BENCHMARK_TEMPLATE(benchmark, circular_futex) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, std::mutex) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, std::shared_mutex) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, std::recursive_mutex) __VA_ARGS__;\
@@ -1232,6 +1349,7 @@ void BenchmarkLongestWait(benchmark::State& state)
 	ThreadedBenchmarkRunnerMultipleTimes<LongestWaitRunner<T>> runner(state.range(0), state.range(1), num_loops);
 	while (state.KeepRunning())
 	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(100)); // give it enough non RT time to avoid RT trottling (or turn of RT trottling)
 		runner.full_run();
 	}
 	runner.shut_down();
@@ -1297,6 +1415,7 @@ void BenchmarkLongestIdle(benchmark::State& state)
 	ThreadedBenchmarkRunnerMultipleTimes<LongestIdleRunner<T>> runner(state.range(0), state.range(1), num_loops);
 	while (state.KeepRunning())
 	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(100)); // give it enough non RT time to avoid RT trottling (or turn of RT trottling)
 		runner.full_run();
 	}
 	runner.shut_down();
@@ -1686,8 +1805,21 @@ void benchmark_yield(benchmark::State& state)
 }
 BENCHMARK(benchmark_yield);
 
+#include <sys/types.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sched.h>
+
 int main(int argc, char* argv[])
 {
+        int rc = set_realtime_priority(getpid(), SCHED_FIFO, sched_get_priority_min(SCHED_FIFO)); // min RT prio is usually more then enough
+        if (rc != 0) {
+            exit(rc);
+        }
+
 	::benchmark::Initialize(&argc, argv);
 	::benchmark::RunSpecifiedBenchmarks();
 }
