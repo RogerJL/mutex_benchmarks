@@ -29,10 +29,8 @@
 #endif
 
 /*
- * This benchmark is disturbed by realtime trottling (see https://lwn.net/Articles/296419/) I have found these values to work quite well
- * 
- * # echo  5000000 > /proc/sys/kernel/sched_rt_period_us
- * # echo  4990000 > /proc/sys/kernel/sched_rt_runtime_us
+ * This benchmark is disturbed by realtime trottling (see https://lwn.net/Articles/296419/)
+ * I have found that CPU affinity can be used instead!
  */
 int set_realtime_priority(pid_t pid, int policy, int priority)
 {
@@ -107,121 +105,6 @@ inline void futex_wake_all(std::atomic<T>& to_wake)
 	syscall(SYS_futex, &to_wake, FUTEX_WAKE_PRIVATE, std::numeric_limits<int>::max(), nullptr, nullptr, 0);
 #endif
 }
-
-template<typename T>
-struct circular_work_queue
-{
-    static constexpr int32_t unlocked = 1;
-    static constexpr int32_t locked = 0;
-    static constexpr int32_t sleeper = -1;
-
-    circular_work_queue(unsigned _slots) :
-        slots{_slots},
-        write_index{0},
-        read_index{0},
-        futexes{new std::atomic<int32_t>[_slots]},
-        work_packages{new T[_slots]}
-        {
-        // all threads might sleep
-        for (unsigned ix = 0; ix < _slots; ix++) {
-            futexes[ix] = locked;
-        }
-    }
-
-    ~circular_work_queue() {
-        delete [] futexes;
-        delete [] work_packages;
-    }
-
-    /* Idea: if there are work waiting on the queue, there should be no wait */
-    T pop() {
-        const uint32_t index = read_index.fetch_add(1, std::memory_order_relaxed);
-        const uint32_t slot = index % slots;
-        std::atomic<int32_t> &state = futexes[slot];
-
-        if (state.exchange(locked, std::memory_order_acquire) == unlocked)
-            return work_packages[slot];
-        while (state.exchange(sleeper, std::memory_order_acquire) != unlocked)
-        {
-            futex_wait(state, sleeper);
-        }
-        return work_packages[slot];
-    }
-
-    void push(T work_to_do) {
-        const uint32_t w_index = write_index.fetch_add(1, std::memory_order_relaxed);
-        const uint32_t slot = w_index % slots;
-        std::atomic<int32_t> &state = futexes[slot];
-
-        work_packages[slot] = work_to_do;
-
-        if (state.exchange(unlocked, std::memory_order_release) == sleeper)
-            futex_wake_single(state);
-    }
-
-private:
-    unsigned slots;
-    std::atomic<uint32_t> write_index;
-    std::atomic<uint32_t> read_index;
-    std::atomic<int32_t> *futexes;
-    T *work_packages;
-};
-
-/*
-struct prioritized_circular_work_queues
-{
-    T pop() {
-        return pop(0, now());
-    }
-
-    private pop(int prio, long start) {
-        w = q[prio].pop();
-        if (!w.isCheck()) {
-            return w;
-        }
-
-        prio_queues[prio].push(w.withTime(time)); // just removed one, low risk of being blocking
-
-        w = prio_queues[prio].pop(); // non blocking: read back w with updated time, another check, or a more important job
-        if (w.getTime() - time >= 0) { // found a check added after start of scan, do it!
-            return pop(prio + 1, start);
-        } else if (w.isCheck()) {
-            prio_queues[prio].push(w);
-        } else {
-            // check is still not done
-            for (ix = prio - 1; ix >= 0; ix--) {
-                prio_queues[ix].push(new Check())
-            }
-            return w;
-        }
-    }
-};
-*/
-
-#define MAX_CONCURRENT_QUEUED_ITEMS (1U)
-#define MAX_QUEUING_THREADS (2*no_of_enabled_cpus)
-struct circular_futex
-{
-    circular_futex() :
-        queue{std::max(MAX_CONCURRENT_QUEUED_ITEMS, MAX_QUEUING_THREADS)}
-    {
-        unlock();
-    }
-
-    void lock() {
-        int work_to_do = queue.pop();
-        // process work
-        //printf("work %d\n", work_to_do);
-    }
-
-    void unlock() {
-        // store new work
-        static int counter;
-        queue.push(counter++);
-    }
-private:
-    circular_work_queue<int> queue;
-};
 
 
 struct ticket_mutex
@@ -852,7 +735,6 @@ void benchmark_mutex_lock_unlock(benchmark::State& state)
 
 #define RegisterBenchmarkWithAllMutexes(benchmark, ...)\
     BENCHMARK_TEMPLATE(benchmark, spinlock_amd) __VA_ARGS__;\
-    BENCHMARK_TEMPLATE(benchmark, circular_futex) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, futex_mutex) __VA_ARGS__;\
 /*#define RegisterBenchmarkWithAllMutexes(benchmark, ...)\
     BENCHMARK_TEMPLATE(benchmark, std::mutex) __VA_ARGS__;\
@@ -1399,11 +1281,11 @@ struct LongestWaitRunner
 template<typename T>
 void BenchmarkLongestWait(benchmark::State& state)
 {
+	std::this_thread::sleep_for(std::chrono::milliseconds(100)); // give it enough non RT time to avoid RT trottling (or turn of RT trottling)
 	static constexpr size_t num_loops = 1024 * 16;
 	ThreadedBenchmarkRunnerMultipleTimes<LongestWaitRunner<T>> runner(state.range(0), state.range(1), num_loops);
 	while (state.KeepRunning())
 	{
-		std::this_thread::sleep_for(std::chrono::milliseconds(100)); // give it enough non RT time to avoid RT trottling (or turn of RT trottling)
 		runner.full_run();
 	}
 	runner.shut_down();
@@ -1494,14 +1376,14 @@ static void CustomBenchmarkArguments(benchmark::internal::Benchmark* b)
 	}
 	b->Args({ 1, no_of_enabled_cpus });
 	b->Args({ 1, 2*no_of_enabled_cpus });
-        
+
 	for (unsigned int i = 2; i < no_of_enabled_cpus; i *= 2)
 	{
 		b->Args({ i, i });
 	}
 	b->Args({ no_of_enabled_cpus, no_of_enabled_cpus });
 	b->Args({ 2*no_of_enabled_cpus, 2*no_of_enabled_cpus });
-        
+
 	for (unsigned int i = 2; i < no_of_enabled_cpus; i *= 2)
 	{
 		unsigned int num_threads = std::max(1U, no_of_enabled_cpus / i);
@@ -1846,15 +1728,15 @@ void BenchmarkShmemq(State& state)
 	state.SetItemsProcessed(REPETITIONS * state.iterations());
 }
 
-//RegisterBenchmarkWithAllMutexes(BenchmarkShmemq, ->Arg(256));
-//RegisterBenchmarkWithAllMutexes(BenchmarkDemingWS);
+RegisterBenchmarkWithAllMutexes(BenchmarkShmemq, ->Arg(256));
+RegisterBenchmarkWithAllMutexes(BenchmarkDemingWS);
 //err RegisterBenchmarkWithAllMutexes(BenchmarkThroughputMultipleMutex, ->Apply(CustomBenchmarkArguments));
 //err RegisterBenchmarkWithAllMutexes(BenchmarkThroughput, ->Apply(CustomBenchmarkArguments));
-// skip RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutex, ->Apply(CustomBenchmarkArguments));
+RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutex, ->Apply(CustomBenchmarkArguments));
 RegisterBenchmarkWithAllMutexes(BenchmarkLongestIdle, ->Apply(CustomBenchmarkArguments));
 RegisterBenchmarkWithAllMutexes(BenchmarkLongestWait, ->Apply(CustomBenchmarkArguments));
-//RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreWork, ->Apply(CustomBenchmarkArguments));
-//RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreIdle, ->Apply(CustomBenchmarkArguments));
+RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreWork, ->Apply(CustomBenchmarkArguments));
+RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreIdle, ->Apply(CustomBenchmarkArguments));
 
 void benchmark_yield(benchmark::State& state)
 {
