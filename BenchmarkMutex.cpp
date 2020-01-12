@@ -1370,19 +1370,21 @@ void BenchmarkLongestIdle(benchmark::State& state)
 
 static void CustomBenchmarkArguments(benchmark::internal::Benchmark* b)
 {
+        unsigned int max_num_threads = 2 * std::thread::hardware_concurrency();
+
 	for (unsigned int i = 1; i < no_of_enabled_cpus; i *= 2)
 	{
 		b->Args({ 1, i });
 	}
 	b->Args({ 1, no_of_enabled_cpus });
-	b->Args({ 1, 2*no_of_enabled_cpus });
+	b->Args({ 1, max_num_threads });
 
 	for (unsigned int i = 2; i < no_of_enabled_cpus; i *= 2)
 	{
 		b->Args({ i, i });
 	}
 	b->Args({ no_of_enabled_cpus, no_of_enabled_cpus });
-	b->Args({ 2*no_of_enabled_cpus, 2*no_of_enabled_cpus });
+	b->Args({ max_num_threads, max_num_threads });
 
 	for (unsigned int i = 2; i < no_of_enabled_cpus; i *= 2)
 	{
@@ -1393,7 +1395,7 @@ static void CustomBenchmarkArguments(benchmark::internal::Benchmark* b)
 		}
 	}
 	b->Args({ no_of_enabled_cpus, 1 });
-	b->Args({ 2*no_of_enabled_cpus, 1 });
+	b->Args({ max_num_threads, 1 });
 }
 
 
@@ -1782,7 +1784,7 @@ int main(int argc, char* argv[])
         //no_of_enabled_cpus = count_enabled_cpus();
         std::cout << "Number of enabled cpus " << no_of_enabled_cpus << std::endl;
 
-        int rt_rc = set_realtime_priority(getpid(), SCHED_FIFO, sched_get_priority_min(SCHED_FIFO)); // min RT prio is usually more then enough
+        int rt_rc = set_realtime_priority(getpid(), SCHED_FIFO, 12); // RR 10 is used by firefox...
 
         long long actual_runtime_us = check_proc_setting(runtime_filename);
         long long actual_period_us = check_proc_setting(period_filename);
@@ -1802,7 +1804,7 @@ int main(int argc, char* argv[])
                 std::cout << "got aggressive protection with recommended values, will NOT perform as expected" << std::endl;
             }
             std::cout << "Alternative protection is to avoid using one CPU for RT, i.e. set affinity excluding one cpu for all RT treads" << std::endl;
-            std::cout << "$ taskset CPU_MASK " << argv[0] << std::endl;
+            std::cout << "$ taskset --cpu-list 1-999 " << argv[0] << std::endl; // cpu0 is not selected
         } else {
             std::cout << "***INFO*** Spare CPUs are allowed to run non RT processes ";
             if (actual_runtime_us == SAFE_RUNTIME_US && actual_period_us == SAFE_PERIOD_US) {
