@@ -58,6 +58,26 @@ int set_realtime_priority(pid_t pid, int policy, int priority)
         return -1;
 }
 
+unsigned int count_enabled_cpus() {
+        // how many cores are enabled for us?
+        unsigned int cpus = std::thread::hardware_concurrency();
+        size_t cpusetsize = CPU_ALLOC_SIZE(cpus);
+        cpu_set_t *mask = CPU_ALLOC(cpusetsize);
+
+        CPU_ZERO_S(cpusetsize, mask);
+        if (sched_getaffinity(0, cpusetsize, mask)) {
+            perror("sched_getaffinity");
+        }
+
+
+        int count = CPU_COUNT_S(cpusetsize, mask);
+        CPU_FREE(mask);
+        return count;
+}
+
+unsigned int no_of_enabled_cpus = count_enabled_cpus();
+
+
 // todo: try WTF lock (aka parking lot)
 
 template<typename T>
@@ -147,8 +167,39 @@ private:
     T *work_packages;
 };
 
+/*
+struct prioritized_circular_work_queues
+{
+    T pop() {
+        return pop(0, now());
+    }
+
+    private pop(int prio, long start) {
+        w = q[prio].pop();
+        if (!w.isCheck()) {
+            return w;
+        }
+
+        prio_queues[prio].push(w.withTime(time)); // just removed one, low risk of being blocking
+
+        w = prio_queues[prio].pop(); // non blocking: read back w with updated time, another check, or a more important job
+        if (w.getTime() - time >= 0) { // found a check added after start of scan, do it!
+            return pop(prio + 1, start);
+        } else if (w.isCheck()) {
+            prio_queues[prio].push(w);
+        } else {
+            // check is still not done
+            for (ix = prio - 1; ix >= 0; ix--) {
+                prio_queues[ix].push(new Check())
+            }
+            return w;
+        }
+    }
+};
+*/
+
 #define MAX_CONCURRENT_QUEUED_ITEMS (1U)
-#define MAX_QUEUING_THREADS (2*std::thread::hardware_concurrency())
+#define MAX_QUEUING_THREADS (2*no_of_enabled_cpus)
 struct circular_futex
 {
     circular_futex() :
@@ -800,7 +851,10 @@ void benchmark_mutex_lock_unlock(benchmark::State& state)
 #endif
 
 #define RegisterBenchmarkWithAllMutexes(benchmark, ...)\
+    BENCHMARK_TEMPLATE(benchmark, spinlock_amd) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, circular_futex) __VA_ARGS__;\
+    BENCHMARK_TEMPLATE(benchmark, futex_mutex) __VA_ARGS__;\
+/*#define RegisterBenchmarkWithAllMutexes(benchmark, ...)\
     BENCHMARK_TEMPLATE(benchmark, std::mutex) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, std::shared_mutex) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, std::recursive_mutex) __VA_ARGS__;\
@@ -1411,11 +1465,11 @@ struct LongestIdleRunner
 template<typename T>
 void BenchmarkLongestIdle(benchmark::State& state)
 {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // give it enough non RT time to clear RT trottling (or turn of RT trottling)
 	static constexpr size_t num_loops = 1024 * 16;
 	ThreadedBenchmarkRunnerMultipleTimes<LongestIdleRunner<T>> runner(state.range(0), state.range(1), num_loops);
 	while (state.KeepRunning())
 	{
-		std::this_thread::sleep_for(std::chrono::milliseconds(100)); // give it enough non RT time to avoid RT trottling (or turn of RT trottling)
 		runner.full_run();
 	}
 	runner.shut_down();
@@ -1434,24 +1488,30 @@ void BenchmarkLongestIdle(benchmark::State& state)
 
 static void CustomBenchmarkArguments(benchmark::internal::Benchmark* b)
 {
-	int hardware_concurrency = std::thread::hardware_concurrency();
-	int max_num_threads = hardware_concurrency * 2;
-	for (int i = 1; i <= max_num_threads; i *= 2)
+	for (unsigned int i = 1; i < no_of_enabled_cpus; i *= 2)
 	{
 		b->Args({ 1, i });
 	}
-	for (int i = 2; i <= max_num_threads; i *= 2)
+	b->Args({ 1, no_of_enabled_cpus });
+	b->Args({ 1, 2*no_of_enabled_cpus });
+        
+	for (unsigned int i = 2; i < no_of_enabled_cpus; i *= 2)
 	{
 		b->Args({ i, i });
 	}
-	for (int i = 2; i <= max_num_threads; i *= 2)
+	b->Args({ no_of_enabled_cpus, no_of_enabled_cpus });
+	b->Args({ 2*no_of_enabled_cpus, 2*no_of_enabled_cpus });
+        
+	for (unsigned int i = 2; i < no_of_enabled_cpus; i *= 2)
 	{
-		int num_threads = std::max(1, hardware_concurrency / i);
+		unsigned int num_threads = std::max(1U, no_of_enabled_cpus / i);
 		if (num_threads != i)
 		{
 			b->Args({ i, num_threads });
 		}
 	}
+	b->Args({ no_of_enabled_cpus, 1 });
+	b->Args({ 2*no_of_enabled_cpus, 1 });
 }
 
 
@@ -1786,15 +1846,15 @@ void BenchmarkShmemq(State& state)
 	state.SetItemsProcessed(REPETITIONS * state.iterations());
 }
 
-RegisterBenchmarkWithAllMutexes(BenchmarkShmemq, ->Arg(256));
-RegisterBenchmarkWithAllMutexes(BenchmarkDemingWS);
-RegisterBenchmarkWithAllMutexes(BenchmarkThroughputMultipleMutex, ->Apply(CustomBenchmarkArguments));
-RegisterBenchmarkWithAllMutexes(BenchmarkThroughput, ->Apply(CustomBenchmarkArguments));
-RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutex, ->Apply(CustomBenchmarkArguments));
+//RegisterBenchmarkWithAllMutexes(BenchmarkShmemq, ->Arg(256));
+//RegisterBenchmarkWithAllMutexes(BenchmarkDemingWS);
+//err RegisterBenchmarkWithAllMutexes(BenchmarkThroughputMultipleMutex, ->Apply(CustomBenchmarkArguments));
+//err RegisterBenchmarkWithAllMutexes(BenchmarkThroughput, ->Apply(CustomBenchmarkArguments));
+// skip RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutex, ->Apply(CustomBenchmarkArguments));
 RegisterBenchmarkWithAllMutexes(BenchmarkLongestIdle, ->Apply(CustomBenchmarkArguments));
 RegisterBenchmarkWithAllMutexes(BenchmarkLongestWait, ->Apply(CustomBenchmarkArguments));
-RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreWork, ->Apply(CustomBenchmarkArguments));
-RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreIdle, ->Apply(CustomBenchmarkArguments));
+//RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreWork, ->Apply(CustomBenchmarkArguments));
+//RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreIdle, ->Apply(CustomBenchmarkArguments));
 
 void benchmark_yield(benchmark::State& state)
 {
@@ -1812,12 +1872,77 @@ BENCHMARK(benchmark_yield);
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#include <iostream>
+#include <fstream>
+#include <string>
 
+long long check_proc_setting(const std::string &filename) {
+            std::ifstream sched_file_us {filename};
+            if (!sched_file_us.is_open()) {
+                std::cout << "Unable to open file:" << filename << std::endl;
+                exit(1);
+            }
+            long long read_value_us;
+            sched_file_us >> read_value_us;
+            sched_file_us.close();
+
+            return read_value_us;
+}
+
+const std::string runtime_filename = "/proc/sys/kernel/sched_rt_runtime_us";
+const std::string period_filename = "/proc/sys/kernel/sched_rt_period_us";
+#define SUGGESTED_PERIOD_US (500000)
+#define SUGGESTED_RUNTIME_US (400000) // take away 100 ms every 500 ms
+#define SAFE_PERIOD_US (5000000)
+#define SAFE_RUNTIME_US (4990000) // take away 10 ms every 5 s (larger than test steps)
 int main(int argc, char* argv[])
 {
-        int rc = set_realtime_priority(getpid(), SCHED_FIFO, sched_get_priority_min(SCHED_FIFO)); // min RT prio is usually more then enough
-        if (rc != 0) {
-            exit(rc);
+        //no_of_enabled_cpus = count_enabled_cpus();
+        std::cout << "Number of enabled cpus " << no_of_enabled_cpus << std::endl;
+
+        int rt_rc = set_realtime_priority(getpid(), SCHED_FIFO, sched_get_priority_min(SCHED_FIFO)); // min RT prio is usually more then enough
+
+        long long actual_runtime_us = check_proc_setting(runtime_filename);
+        long long actual_period_us = check_proc_setting(period_filename);
+
+        if (no_of_enabled_cpus >= std::thread::hardware_concurrency() && rt_rc == 0) {
+            std::cout << "***WARNING*** ALL cpus are enabled for use with RT ";
+            if (actual_runtime_us < 0) {
+                std::cout << "and no protection" << std::endl;
+                std::cout << "***CRITICAL*** would lock up for long time - exiting!" << std::endl;
+                exit(1);
+            } else if (actual_runtime_us != SUGGESTED_RUNTIME_US || actual_period_us != SUGGESTED_PERIOD_US) {
+                std::cout << "got RT protection, but NOT the recomended (to show its effect), as root do:" << std::endl;
+                // order matters
+                std::cout << "# echo " << SUGGESTED_RUNTIME_US << " > " << runtime_filename << std::endl;
+                std::cout << "# echo " << SUGGESTED_PERIOD_US << " > " << period_filename << std::endl;
+            } else {
+                std::cout << "got aggressive protection with recommended values, will NOT perform as expected" << std::endl;
+            }
+            std::cout << "Alternative protection is to avoid using one CPU for RT, i.e. set affinity excluding one cpu for all RT treads" << std::endl;
+            std::cout << "$ taskset CPU_MASK " << argv[0] << std::endl;
+        } else {
+            std::cout << "***INFO*** Spare CPUs are allowed to run non RT processes ";
+            if (actual_runtime_us == SAFE_RUNTIME_US && actual_period_us == SAFE_PERIOD_US) {
+                std::cout << "using recomended setting for development" << std::endl;
+            } else {
+                if (actual_runtime_us < 0) {
+                    std::cout << "and no RT protection (recomended setting for deployment)" << std::endl;
+                } else if (actual_runtime_us == SUGGESTED_RUNTIME_US && actual_period_us == SUGGESTED_PERIOD_US) {
+                    std::cout << "using aggresive RT protection (should not affect result)" << std::endl;
+                } else {
+                    std::cout << "and RT minor protection interfering with tests, as root do:" << std::endl;
+                }
+                // order matters
+                std::cout << "# echo " << SAFE_PERIOD_US << " > " << period_filename << std::endl;
+                std::cout << "# echo " << SAFE_RUNTIME_US << " > " << runtime_filename << std::endl;
+                std::cout << "for actual demployment (completely turning of the protection) as root do:" << std::endl;
+                std::cout << "# echo -1 > " << runtime_filename << std::endl;
+            }
+        }
+
+        if (rt_rc != 0) {
+            std::cout << "***WARNING*** did not get RT prio, will NOT perform as expected" << std::endl;
         }
 
 	::benchmark::Initialize(&argc, argv);
