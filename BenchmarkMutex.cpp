@@ -42,7 +42,7 @@ int set_realtime_priority(pid_t pid, int policy, int priority)
         * set the process to realtime privs
         */
 
-        printf("Attempt to set realtime for pid %d ", pid);
+        printf("Attempt to set realtime for pid %d policy: %d prio: %d ", pid, policy, priority);
 
         // do not set SCHED_RESET_ON_FORK bit as we have no control over what threads are used in benchmark
         if (sched_setscheduler(pid, policy, &schp) == 0) {
@@ -734,8 +734,8 @@ void benchmark_mutex_lock_unlock(benchmark::State& state)
 #endif
 
 #define RegisterBenchmarkWithAllMutexes(benchmark, ...)\
-    BENCHMARK_TEMPLATE(benchmark, spinlock_amd) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, futex_mutex) __VA_ARGS__;\
+    BENCHMARK_TEMPLATE(benchmark, spinlock_amd) __VA_ARGS__;\
 /*#define RegisterBenchmarkWithAllMutexes(benchmark, ...)\
     BENCHMARK_TEMPLATE(benchmark, std::mutex) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, std::shared_mutex) __VA_ARGS__;\
@@ -1148,6 +1148,17 @@ void BenchmarkContendedMutex(benchmark::State& state)
 	runner.shut_down();
 }
 
+auto work() {
+    std::chrono::high_resolution_clock::time_point time_before = std::chrono::high_resolution_clock::now();
+
+    volatile size_t sum = 0;
+    for (size_t i = 1000; i != 0; --i) {
+        sum += i;
+    }
+    
+    return std::chrono::high_resolution_clock::now() - time_before;
+}
+
 template<typename T>
 struct ContendedMutexRunnerMoreIdle
 {
@@ -1177,11 +1188,6 @@ struct ContendedMutexRunnerMoreIdle
 			mutex.lock();
 			++sum;
 			mutex.unlock();
-			std::this_thread::sleep_for(std::chrono::microseconds(1));
-			/*if (iteration < 1024)
-			{
-				std::this_thread::sleep_for(std::chrono::microseconds(1024 - iteration) / 32);
-			}*/
 		}
 	}
 };
@@ -1245,20 +1251,20 @@ struct TopNHeap
 template<typename T>
 struct LongestWaitRunner
 {
-	TopNHeap<size_t, 4> longest_waits;
+	TopNHeap<double, 4> longest_waits;
 	T mutex;
-	size_t current_longest_wait = 0;
+        double current_longest_wait{0.0};
 	size_t num_loops = 1;
 
 	explicit LongestWaitRunner(int, size_t num_loops)
 		: num_loops(num_loops)
 	{
-		longest_waits.fill(0);
+		longest_waits.fill(0.0);
 	}
 
 	void start_run()
 	{
-		current_longest_wait = 0;
+		current_longest_wait = 0.0;
 	}
 	void end_run()
 	{
@@ -1271,9 +1277,12 @@ struct LongestWaitRunner
 		{
 			auto time_before = std::chrono::high_resolution_clock::now();
 			mutex.lock();
-			size_t wait_time_nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - time_before).count();
-			current_longest_wait = std::max(wait_time_nanos, current_longest_wait);
+			auto wait_duration = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - time_before).count();
+                        if (wait_duration > current_longest_wait) {
+                            current_longest_wait = wait_duration;
+                        }
 			mutex.unlock();
+                        work();
 		}
 	}
 };
@@ -1289,8 +1298,8 @@ void BenchmarkLongestWait(benchmark::State& state)
 		runner.full_run();
 	}
 	runner.shut_down();
-	TopNHeap<size_t, 4> longest_waits_merged;
-	longest_waits_merged.fill(0);
+	TopNHeap<double, 4> longest_waits_merged;
+	longest_waits_merged.fill(0.0);
 	for (auto& runner : runner.runners)
 	{
 		longest_waits_merged.merge(runner.state.longest_waits);
@@ -1298,29 +1307,30 @@ void BenchmarkLongestWait(benchmark::State& state)
 	longest_waits_merged.sort();
 	for (size_t i = 0; i < longest_waits_merged.heap.size(); ++i)
 	{
-		state.counters["Wait" + std::to_string(i)] = static_cast<double>(longest_waits_merged.heap[i]);
+		state.counters["Wait" + std::to_string(i)] = longest_waits_merged.heap[i];
 	}
 }
 
 template<typename T>
 struct LongestIdleRunner
 {
-	TopNHeap<size_t, 4> longest_idles;
+	TopNHeap<double, 4> longest_idles;
 	T mutex;
-	size_t current_longest_idle = 0;
+	double current_longest_idle = 0.0;
 	size_t num_loops = 1;
 	bool first = true;
+        // from my unlock to my lock
 	std::chrono::high_resolution_clock::time_point time_before = std::chrono::high_resolution_clock::now();
 
 	explicit LongestIdleRunner(int, size_t num_loops)
 		: num_loops(num_loops)
 	{
-		longest_idles.fill(0);
+		longest_idles.fill(0.0);
 	}
 
 	void start_run()
 	{
-		current_longest_idle = 0;
+		current_longest_idle = 0.0;
 		first = true;
 	}
 	void end_run()
@@ -1333,13 +1343,14 @@ struct LongestIdleRunner
 		for (size_t i = num_loops; i != 0; --i)
 		{
 			mutex.lock();
-			size_t wait_time_nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - time_before).count();
+			auto wait_duration = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - time_before).count();
 			if (first)
 				first = false;
-			else if (wait_time_nanos > current_longest_idle)
-				current_longest_idle = wait_time_nanos;
+			else if (wait_duration > current_longest_idle)
+				current_longest_idle = wait_duration;
 			time_before = std::chrono::high_resolution_clock::now();
 			mutex.unlock();
+                        time_before += work();
 		}
 	}
 };
@@ -1355,7 +1366,7 @@ void BenchmarkLongestIdle(benchmark::State& state)
 		runner.full_run();
 	}
 	runner.shut_down();
-	TopNHeap<size_t, 4> longest_idles_merged;
+	TopNHeap<double, 4> longest_idles_merged;
 	longest_idles_merged.fill(0);
 	for (auto& runner : runner.runners)
 	{
@@ -1364,7 +1375,7 @@ void BenchmarkLongestIdle(benchmark::State& state)
 	longest_idles_merged.sort();
 	for (size_t i = 0; i < longest_idles_merged.heap.size(); ++i)
 	{
-		state.counters["Idle" + std::to_string(i)] = static_cast<double>(longest_idles_merged.heap[i]);
+		state.counters["Idle" + std::to_string(i)] = longest_idles_merged.heap[i];
 	}
 }
 
@@ -1730,15 +1741,15 @@ void BenchmarkShmemq(State& state)
 	state.SetItemsProcessed(REPETITIONS * state.iterations());
 }
 
-RegisterBenchmarkWithAllMutexes(BenchmarkShmemq, ->Arg(256));
-RegisterBenchmarkWithAllMutexes(BenchmarkDemingWS);
+// skip RegisterBenchmarkWithAllMutexes(BenchmarkShmemq, ->Arg(256));
+// skip RegisterBenchmarkWithAllMutexes(BenchmarkDemingWS);
 //err RegisterBenchmarkWithAllMutexes(BenchmarkThroughputMultipleMutex, ->Apply(CustomBenchmarkArguments));
 //err RegisterBenchmarkWithAllMutexes(BenchmarkThroughput, ->Apply(CustomBenchmarkArguments));
-RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutex, ->Apply(CustomBenchmarkArguments));
+// skip RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutex, ->Apply(CustomBenchmarkArguments));
 RegisterBenchmarkWithAllMutexes(BenchmarkLongestIdle, ->Apply(CustomBenchmarkArguments));
 RegisterBenchmarkWithAllMutexes(BenchmarkLongestWait, ->Apply(CustomBenchmarkArguments));
-RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreWork, ->Apply(CustomBenchmarkArguments));
-RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreIdle, ->Apply(CustomBenchmarkArguments));
+// skip RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreWork, ->Apply(CustomBenchmarkArguments));
+// RegisterBenchmarkWithAllMutexes(BenchmarkContendedMutexMoreIdle, ->Apply(CustomBenchmarkArguments));
 
 void benchmark_yield(benchmark::State& state)
 {
@@ -1784,7 +1795,7 @@ int main(int argc, char* argv[])
         //no_of_enabled_cpus = count_enabled_cpus();
         std::cout << "Number of enabled cpus " << no_of_enabled_cpus << std::endl;
 
-        int rt_rc = set_realtime_priority(getpid(), SCHED_FIFO, 12); // RR 10 is used by firefox...
+        int rt_rc = set_realtime_priority(getpid(), SCHED_RR, 11); // RR 10 is used by firefox...
 
         long long actual_runtime_us = check_proc_setting(runtime_filename);
         long long actual_period_us = check_proc_setting(period_filename);
